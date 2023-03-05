@@ -6,20 +6,30 @@ from baseline.DAGMM.run import DAGMM
 import argparse
 import numpy as np
 
-from diffusion import Diffusion
+from diffusion import Diffusion, DiffusionBagging
 import os
 import pandas as pd
 import torch
 
 from myutils import Utils
+from ICL import ICL
 
+import sklearn.preprocessing as skp
+import sklearn.metrics as skm
 from data_generator import DataGenerator
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
+
+def low_density_anomalies(test_log_probs, num_anomalies):
+    #anomaly_indices = np.argpartition(scores, -num_anomalies)[-num_anomalies:]
+    anomaly_indices = np.argpartition(test_log_probs, num_anomalies-1)[:num_anomalies]
+    preds = np.zeros(len(test_log_probs))
+    preds[anomaly_indices] = 1
+    return preds
 
 def main(args):
     seed = args.seed
     
-    dir = './minmax/'
+    dir = './results/'
     
     datagenerator = DataGenerator(seed = seed) # data generator
     utils = Utils() # utils function
@@ -28,6 +38,8 @@ def main(args):
     #dataset_list = ['32_shuttle', '38_thyroid']
     
     dataset_list = os.listdir('datasets/Classical')
+    dataset_list.extend(os.listdir('datasets/NLP_by_RoBERTa'))
+    dataset_list.extend(os.listdir('datasets/CV_by_ResNet18'))
     #dataset_list.sort()
 
     model_dict = {}
@@ -36,11 +48,22 @@ def main(args):
     for _ in ['IForest', 'OCSVM', 'CBLOF', 'COPOD', 'ECOD', 'FeatureBagging', 'HBOS', 'KNN', 'LODA',
                       'LOF', 'MCD', 'PCA', 'DeepSVDD']:
         model_dict[_] = PYOD
+        
+        
 
     # DAGMM
     #model_dict['DAGMM'] = DAGMM
     
     model_dict = {}
+    
+    for _ in ['COF', 'SOD', 'SOGAAL', 'MOGAAL', 'MCD']:
+        model_dict[_] = PYOD
+        
+    model_dict['DAGMM'] = DAGMM
+    
+    model_dict = {}
+    
+    #model_dict['ICL'] = ICL
     
     aucroc_name = dir + str(seed) + "_AUCROC.csv"
     aucpr_name = dir + str(seed) + "_AUCPR.csv"
@@ -80,31 +103,36 @@ def main(args):
         # import the dataset
         datagenerator.dataset = dataset # specify the dataset name
         data = datagenerator.generator(la=0, realistic_synthetic_mode=None, noise_type=None) # only 10% labeled anomalies are available
-
+        
+        #data['X_train'] = skp.power_transform(data['X_train'])
+        #data['X_test'] = skp.power_transform(data['X_test'])
+        
         print(data['X_train'][0].size)
         # model initialization
-        clf = Diffusion([data['X_train'][0].size, 256, 512, 256, 1]).to(device)
+        #clf = Diffusion([data['X_train'][0].size, 512, 1024, 512], binning=True).to(device)
+        clf = DiffusionBagging()
         print(clf)
         
         model = clf
-        scaler = StandardScaler().fit(data['X_train'])
-        data['X_train'] = scaler.transform(data['X_train'])
-        data['X_test'] = scaler.transform(data['X_test'])
-        
         
         # training, for unsupervised models the y label will be discarded
-        clf, f1_score = clf.fit(X_train=data['X_train'], y_train=data['y_train'], X_test = data['X_test'], Y_test = data['y_test'], epochs=500, device=device)
+        clf = clf.fit(X_train=data['X_train'], y_train=data['y_train'], X_test = data['X_test'], Y_test = data['y_test'], epochs=420, device=device)
         
         # output predicted anomaly score on testing set
         score = clf.predict_score(data['X_test'], device = device)
+        
+        indices = np.arange(len(data['y_test']))
+        p = low_density_anomalies(-score, len(indices[data['y_test']==1]))
+        f1_score = skm.f1_score(data['y_test'], p)
 
         # evaluation
         result = utils.metric(y_true=data['y_test'], y_score=score)
         
         # save results
-        df_AUCROC.loc[dataset, 'diffusion'] = result['aucroc']
-        df_AUCPR.loc[dataset, 'diffusion'] = result['aucpr']
-        df_F1.loc[dataset, 'diffusion'] = f1_score
+        model_name = 'diffusion_420_bins_7_bagging'
+        df_AUCROC.loc[dataset, model_name] = result['aucroc']
+        df_AUCPR.loc[dataset, model_name] = result['aucpr']
+        df_F1.loc[dataset, model_name] = f1_score
         
         df_AUCROC.to_csv(aucroc_name)
         df_AUCPR.to_csv(aucpr_name)
@@ -130,6 +158,8 @@ def main(args):
         
         for name, clf in model_dict.items():
             # model initialization
+            if name == "ICL":
+                name = "ICL_bagging"
             clf = clf(seed=seed, model_name=name)
             
             # training, for unsupervised models the y label will be discarded
@@ -139,7 +169,12 @@ def main(args):
                 score = clf.predict_score(data['X_train'], data['X_test'])
             else:
                 score = clf.predict_score(data['X_test'])
-                f1_score = clf.evaluate(data['X_test'], data['y_test'], device=device)
+                
+                indices = np.arange(len(data['y_test']))
+                p = low_density_anomalies(-score, len(indices[data['y_test']==1]))
+                f1_score = skm.f1_score(data['y_test'], p)
+                print(f1_score)
+
                 df_F1.loc[dataset, name] = f1_score
                 df_F1.to_csv(f1_name)
 
@@ -147,6 +182,7 @@ def main(args):
             score[inds] = 0
             
             result = utils.metric(y_true=data['y_test'], y_score=score)
+            print(result['aucroc'])
             
             # save results
             df_AUCROC.loc[dataset, name] = result['aucroc']
