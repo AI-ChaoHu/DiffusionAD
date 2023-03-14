@@ -36,6 +36,16 @@ def binning(t, num_bins = 30, device = 'cpu'):
 def linear_beta_schedule(timesteps, start=0.0001, end=0.01):
     return torch.linspace(start, end, timesteps)
 
+def expo(shape, lamb = 0.2):
+    x =  -torch.log(1 - torch.rand(shape)) * timesteps * lamb
+    for i in range(10):
+        x = torch.where(x < timesteps, x, -torch.log(1 - torch.rand(shape)) * timesteps * lamb)
+    
+    x = torch.minimum(x, torch.tensor(timesteps-1))
+    
+    x = x.long()
+    return x
+
 num_bins = 7
 # Define beta schedule
 T = 300
@@ -114,7 +124,7 @@ class Diffusion(nn.Module):
         self.layers = nn.ModuleList(layers)
         self.output_size = num_bins
 
-        self.drop = torch.nn.Dropout(p=0.5, inplace=False)
+        self.drop = torch.nn.Dropout(p=0.2, inplace=False)
           
     
     def forward(self, x):
@@ -135,38 +145,40 @@ class Diffusion(nn.Module):
       for epoch in range(epochs):
           self.train()
           loss_ = []
+          loss_0 = []
           for x in train_loader:
             x = x.to(device)
             optimizer.zero_grad()
 
             t = torch.randint(0, T, (x.shape[0],), device=device).long()
+            #t = expo((x.shape[0],), 0.9).to(device)
 
             loss = self.loss_fn(self, x, t, device=device)
             loss.backward()
             optimizer.step()
             loss_.append(loss.item())
             
-            # optimizer.zero_grad()
-            # t = torch.zeros((x.shape[0],), device=device).long()
+            self.eval()
+            with torch.no_grad():
+                t = torch.zeros((x.shape[0],), device=device).long()
 
-            # loss = self.loss_fn(self, x, t, device=device)
-            # loss.backward()
-            # optimizer.step()
-            # loss_.append(loss.item())
-        
+                loss = self.loss_fn(self, x, t, device=device)
+                loss_0.append(loss.item())
+            self.train()
           train_losses.append(np.mean(np.array(loss_)))
-          #val_losses.append(np.mean(validation(train_dl)))
+          val_losses.append(np.mean(np.array(loss_0)))
           if epoch % 1 == 0:
             print(self.evaluate(X_test, Y_test, device=device))
             print(roc_auc_score(y_true=Y_test, y_score=self.predict_score(X_test, device=device)))
             print(f"Epoch {epoch} Train Loss: {train_losses[len(train_losses)-1]}")
+            print(f"Epoch {epoch} Val Loss: {val_losses[len(val_losses)-1]}")
           #if epoch > 20:
               #if train_losses[len(train_losses)-1] > train_losses[len(train_losses)-19]:
                   #break
         
-      return self, self.evaluate(X_test, Y_test, device=device)
+      return self
 
-    def predict_score(self, X, device = 'cpu'):
+    def predict_score(self, X, device = 'cpu', is_bagging = False):
       test_loader = DataLoader(torch.from_numpy(X).float(),
                                           batch_size=100, shuffle=False, drop_last=False)
       preds = []
@@ -176,13 +188,16 @@ class Diffusion(nn.Module):
         preds.append(pred_t.squeeze().cpu().detach().numpy())
       
       sig = lambda x : 1/(1+np.exp(-0.05*(x-150)))
-      preds = np.concatenate(preds, axis=0)
+      pred = np.concatenate(preds, axis=0)
       
       if self.binning:
         #preds = np.argmax(preds, axis=1)
-        preds = np.matmul(preds, np.arange(0, preds.shape[-1]))
+        preds = np.matmul(pred, np.arange(0, pred.shape[-1]))
 
-      return sig(preds)
+      if is_bagging:
+          return pred
+      else:
+         return sig(preds)
   
     def evaluate(self, X, y, device = 'cpu'):
       test_loader = DataLoader(torch.from_numpy(X).float(),
@@ -216,14 +231,20 @@ class DiffusionBagging():
       
         self.models = []
         self.perms = []
+        
+        self.num_permutations = 5
+        
+        self.lrs = [1e-4, 1e-4, 5e-5, 3e-4, 1e-5]
+        self.pochs = [400, 200, 400, 100, 500]
     
-    def fit(self, X_train, y_train, X_test, Y_test, epochs = 400, device = "cpu"):
+    def fit(self, X_train, y_train, X_test, Y_test, epochs = 400, batch_size = 64, lr = 1e-4, weight_decay = 5e-4, device = "cpu"):
         d = X_train.shape[1]
         n = X_train.shape[0]
         if self.faster_version=='yes':
             num_permutations = min(int(np.floor(100 / (np.log(n) + d)) + 1),2)
         else:
             num_permutations=int(np.floor(100/(np.log(n)+d))+1)
+        num_permutations = self.num_permutations
         print("going to run for: ", num_permutations, ' permutations')
         for permutations in range(num_permutations):
             if num_permutations > 1:
@@ -235,15 +256,27 @@ class DiffusionBagging():
             model = Diffusion([d, 512, 1024, 512], binning=True).to(device)
             self.models.append(model)
             
-            model.fit(X_train=X_train, y_train=y_train, X_test = X_test, Y_test = Y_test, epochs=epochs, device=device)
+            model.fit(X_train=X_train, y_train=y_train, X_test = X_test, Y_test = Y_test, epochs=self.pochs[permutations], lr = self.lrs[permutations], device=device)
         
         return self
       
     def predict_score(self, X, device = 'cpu'):
-        total = np.zeros(X.shape[0],dtype='f')
+        total = []
         for i, model in enumerate(self.models):
             if len(self.perms) > 0:
                 X = X[:, self.perms[i]]
-            total += model.predict_score(X, device)
-        return total
+            total.append(model.predict_score(X, device, True))
+        pred = np.stack(total)
+        prediction = []
+        for i in range(num_bins):
+            thresh = i
+            pred_1 = np.min(pred, axis=0)[:, :thresh]
+            pred_2 = np.max(pred, axis=0)[:, thresh:]
+            preds = np.concatenate((pred_1, pred_2), axis=1)
+            #preds = np.max(preds, axis=0)
+            preds = np.matmul(preds, np.arange(0, preds.shape[-1]))
+            prediction.append(preds)
+        preds = np.sum(pred, axis=0)
+        prediction.append(np.matmul(preds, np.arange(0, preds.shape[-1])))
+        return prediction
             
